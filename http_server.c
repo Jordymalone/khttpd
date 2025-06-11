@@ -32,11 +32,16 @@
 
 #define RECV_BUFFER_SIZE 4096
 
+extern struct workqueue_struct *khttpd_wq;
+struct httpd_service daemon_list = {.is_stopped = false};
+
 struct http_request {
     struct socket *socket;
     enum http_method method;
     char request_url[128];
     int complete;
+    struct list_head node;           // for list management
+    struct work_struct khttpd_work;  // workitem for workqueue
 };
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
@@ -145,7 +150,7 @@ static int http_parser_callback_message_complete(http_parser *parser)
     return 0;
 }
 
-static int http_server_worker(void *arg)
+static void http_server_worker(struct work_struct *work)
 {
     char *buf;
     struct http_parser parser;
@@ -158,47 +163,72 @@ static int http_server_worker(void *arg)
         .on_body = http_parser_callback_body,
         .on_message_complete = http_parser_callback_message_complete,
     };
-    struct http_request request;
-    struct socket *socket = (struct socket *) arg;
-
-    allow_signal(SIGKILL);
-    allow_signal(SIGTERM);
+    struct http_request *worker =
+        container_of(work, struct http_request, khttpd_work);
 
     buf = kzalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
     if (!buf) {
         pr_err("can't allocate memory!\n");
-        return -1;
+        return;
     }
 
-    request.socket = socket;
     http_parser_init(&parser, HTTP_REQUEST);
-    parser.data = &request;
-    while (!kthread_should_stop()) {
-        int ret = http_server_recv(socket, buf, RECV_BUFFER_SIZE - 1);
+    parser.data = worker;
+    while (!daemon_list.is_stopped) {
+        int ret = http_server_recv(worker->socket, buf, RECV_BUFFER_SIZE - 1);
         if (ret <= 0) {
             if (ret)
                 pr_err("recv error: %d\n", ret);
             break;
         }
         http_parser_execute(&parser, &setting, buf, ret);
-        if (request.complete && !http_should_keep_alive(&parser))
+        if (worker->complete && !http_should_keep_alive(&parser))
             break;
         memset(buf, 0, RECV_BUFFER_SIZE);
     }
-    kernel_sock_shutdown(socket, SHUT_RDWR);
-    sock_release(socket);
+    kernel_sock_shutdown(worker->socket, SHUT_RDWR);
+    sock_release(worker->socket);
     kfree(buf);
-    return 0;
+    return;
+}
+
+static struct work_struct *create_work(struct socket *sk)
+{
+    struct http_request *work =
+        kmalloc(sizeof(*work), GFP_KERNEL);  // GFP_KERNEL is used to allocate
+                                             // memory that can be freed later
+    if (!work) {
+        pr_err("can't allocate memory for work!\n");
+        return NULL;
+    }
+    work->socket = sk;
+    INIT_WORK(&work->khttpd_work, http_server_worker);
+    list_add(&work->node, &daemon_list.head);
+    return &work->khttpd_work;
+}
+
+static void free_work(void)
+{
+    struct http_request *tar, *tmp;
+
+    list_for_each_entry_safe (tar, tmp, &daemon_list.head, node) {
+        kernel_sock_shutdown(tar->socket, SHUT_RDWR);
+        flush_work(&tar->khttpd_work);
+        sock_release(tar->socket);
+        kfree(tar);
+    }
 }
 
 int http_server_daemon(void *arg)
 {
     struct socket *socket;
-    struct task_struct *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
+    struct work_struct *work;
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
+
+    INIT_LIST_HEAD(&daemon_list.head);
 
     while (!kthread_should_stop()) {
         int err = kernel_accept(param->listen_socket, &socket, 0);
@@ -208,11 +238,17 @@ int http_server_daemon(void *arg)
             pr_err("kernel_accept() error: %d\n", err);
             continue;
         }
-        worker = kthread_run(http_server_worker, socket, KBUILD_MODNAME);
-        if (IS_ERR(worker)) {
-            pr_err("can't create more worker process\n");
+        work = create_work(socket);
+        if (!work) {
+            pr_err("can't create work for socket\n");
+            kernel_sock_shutdown(socket, SHUT_RDWR);
+            sock_release(socket);
             continue;
         }
+        queue_work(khttpd_wq, work);
     }
+    daemon_list.is_stopped = true;
+    free_work();
+
     return 0;
 }
