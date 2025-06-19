@@ -13,6 +13,7 @@ struct http_server_param {
 
 struct httpd_service {
     bool is_stopped;
+    char *root_path;  // Used to record the path passed by the user
     struct list_head head;
 };
 

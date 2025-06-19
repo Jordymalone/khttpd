@@ -10,17 +10,23 @@
 
 #define DEFAULT_PORT 8081
 #define DEFAULT_BACKLOG 100
+#define DEFAULT_DOC_ROOT "/home/jordan/linux2025/khttpd/"
 
 static ushort port = DEFAULT_PORT;
 module_param(port, ushort, S_IRUGO);
 static ushort backlog = DEFAULT_BACKLOG;
 module_param(backlog, ushort, S_IRUGO);
+static char *doc_root = DEFAULT_DOC_ROOT;  // Document Root Directory
+module_param(doc_root, charp, 0444);       // user readable
+MODULE_PARM_DESC(doc_root, "Document root directory");
 
 static struct socket *listen_socket;
 static struct http_server_param param;
 static struct task_struct *http_server;
 
 struct workqueue_struct *khttpd_wq;
+
+extern struct httpd_service daemon_list;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 static int set_sock_opt(struct socket *sock,
@@ -161,6 +167,7 @@ static int __init khttpd_init(void)
         pr_err("can't open listen socket\n");
         return err;
     }
+    daemon_list.root_path = doc_root;
     param.listen_socket = listen_socket;
     khttpd_wq = alloc_workqueue(MODULE_NAME, 0, 0);
     if (!khttpd_wq) {
