@@ -8,31 +8,16 @@
 #include "http_parser.h"
 #include "http_server.h"
 
-#define CRLF "\r\n"
-
-#define HTTP_RESPONSE_200_DUMMY                               \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Close" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_200_KEEPALIVE_DUMMY                     \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Keep-Alive" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_501                                              \
-    ""                                                                 \
-    "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
-    "Connection: Close" CRLF CRLF "501 Not Implemented" CRLF
-#define HTTP_RESPONSE_501_KEEPALIVE                                    \
-    ""                                                                 \
-    "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
-    "Connection: KeepAlive" CRLF CRLF "501 Not Implemented" CRLF
-
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE 256
+
+static const char HTML_DOC_HEADER[] =
+    "<html><head><style>\r\n"
+    "body{font-family: monospace; font-size: 15px;}\r\n"
+    "td {padding: 1.5px 6px;}\r\n"
+    "</style></head><body><table>\r\n";
+
+static const char HTML_DOC_FOOTER[] = "</table></body></html>\r\n";
 
 extern struct workqueue_struct *khttpd_wq;
 struct httpd_service daemon_list = {.is_stopped = false, .root_path = NULL};
@@ -85,6 +70,29 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+static void send_http_header(struct socket *sock,
+                             int status,
+                             const char *status_msg,
+                             const char *content_type,
+                             int content_len,
+                             const char *conn_msg)
+{
+    char header[SEND_BUFFER_SIZE];
+    int len;
+
+    len = snprintf(header, sizeof(header),
+                   "HTTP/1.1 %d %s\r\n"
+                   "Content-Type: %s\r\n"
+                   "Connection: %s\r\n",
+                   status, status_msg, content_type, conn_msg);
+    if (content_len >= 0) {
+        len += snprintf(header + len, sizeof(header) - len,
+                        "Content-Length: %d\r\n", content_len);
+    }
+    snprintf(header + len, sizeof(header) - len, "\r\n");
+    http_server_send(sock, header, strlen(header));
+}
+
 // callback for 'iterate_dir', trace entry.
 static bool tracedir(struct dir_context *dir_context,
                      const char *name,
@@ -108,27 +116,17 @@ static bool tracedir(struct dir_context *dir_context,
 static bool handle_directory(struct http_request *request)
 {
     struct file *fp;
-    char buf[SEND_BUFFER_SIZE] = {0};
 
     request->dir_context.actor = tracedir;
     if (request->method != HTTP_GET) {
-        snprintf(buf, SEND_BUFFER_SIZE,
-                 "HTTP/1.1 501 Not Implemented\r\n%s%s%s%s",
-                 "Content-Type: text/plain\r\n", "Content-Length: 19\r\n",
-                 "Connection: Close\r\n", "501 Not Implemented\r\n");
-        http_server_send(request->socket, buf, strlen(buf));
+        send_http_header(request->socket, 501, "Not Implemented", "text/plain",
+                         19, "Close");
+        http_server_send(request->socket, "501 Not Implemented", 19);
         return false;
     }
-    snprintf(buf, SEND_BUFFER_SIZE, "HTTP/1.1 200 OK\r\n%s%s%s",
-             "Connection: Keep-Alive\r\n", "Content-Type: text/html\r\n",
-             "Keep-Alive: timeout=5, max=1000\r\n\r\n");
-    http_server_send(request->socket, buf, strlen(buf));
-
-    snprintf(buf, SEND_BUFFER_SIZE, "%s%s%s%s", "<html><head><style>\r\n",
-             "body{font-family: monospace; font-size: 15px;}\r\n",
-             "td {padding: 1.5px 6px;}\r\n",
-             "</style></head><body><table>\r\n");
-    http_server_send(request->socket, buf, strlen(buf));
+    send_http_header(request->socket, 200, "OK", "text/html", -1, "Keep-Alive");
+    http_server_send(request->socket, HTML_DOC_HEADER,
+                     sizeof(HTML_DOC_HEADER) - 1);
 
     fp = filp_open(daemon_list.root_path, O_RDONLY | O_DIRECTORY, 0);
     if (IS_ERR(fp)) {
@@ -137,9 +135,9 @@ static bool handle_directory(struct http_request *request)
     }
 
     iterate_dir(fp, &request->dir_context);
-    snprintf(buf, SEND_BUFFER_SIZE, "</table></body></html>\r\n");
-    http_server_send(request->socket, buf, strlen(buf));
     filp_close(fp, NULL);
+    http_server_send(request->socket, HTML_DOC_FOOTER,
+                     sizeof(HTML_DOC_FOOTER) - 1);
     return true;
 }
 
