@@ -2,7 +2,10 @@
 
 #include <linux/fs.h>
 #include <linux/kthread.h>
+#include <linux/namei.h>  // for kern_path
+#include <linux/path.h>   // for struct path
 #include <linux/sched/signal.h>
+#include <linux/stat.h>  // for S_ISDIR, S_ISREG
 #include <linux/tcp.h>
 
 #include "http_parser.h"
@@ -11,6 +14,7 @@
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE 256
 
+/* Define fixed HTML content as constants for readability and efficiency */
 static const char HTML_DOC_HEADER[] =
     "<html><head><style>\r\n"
     "body{font-family: monospace; font-size: 15px;}\r\n"
@@ -101,19 +105,29 @@ static bool tracedir(struct dir_context *dir_context,
                      u64 ino,
                      unsigned int d_type)
 {
-    if (strcmp(name, ".") && strcmp(name, "..")) {
-        struct http_request *request =
-            container_of(dir_context, struct http_request, dir_context);
-        char buf[SEND_BUFFER_SIZE] = {0};
+    struct http_request *request =
+        container_of(dir_context, struct http_request, dir_context);
+    char buf[SEND_BUFFER_SIZE] = {0};
 
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return true;
+    }
+    /* * Based on the entry type, format the link appropriately.
+     * The href attribute should be relative to the current directory.
+     */
+    if (d_type == DT_DIR) {
+        snprintf(buf, SEND_BUFFER_SIZE,
+                 "<tr><td><a href=\"%s/\">%s/</a></td></tr>\r\n", name, name);
+    } else {
         snprintf(buf, SEND_BUFFER_SIZE,
                  "<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", name, name);
-        http_server_send(request->socket, buf, strlen(buf));
     }
+    http_server_send(request->socket, buf, strlen(buf));
+
     return true;
 }
 
-static bool handle_directory(struct http_request *request)
+static bool handle_directory(struct http_request *request, const char *path)
 {
     struct file *fp;
 
@@ -128,9 +142,16 @@ static bool handle_directory(struct http_request *request)
     http_server_send(request->socket, HTML_DOC_HEADER,
                      sizeof(HTML_DOC_HEADER) - 1);
 
-    fp = filp_open(daemon_list.root_path, O_RDONLY | O_DIRECTORY, 0);
+    if (strcmp(request->request_url, "/") != 0) {
+        char buf[SEND_BUFFER_SIZE] = {0};
+        snprintf(buf, sizeof(buf),
+                 "<tr><td><a href=\"..\">..</a></td></tr>\r\n");
+        http_server_send(request->socket, buf, strlen(buf));
+    }
+
+    fp = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
     if (IS_ERR(fp)) {
-        pr_info("Open directory '%s' failed", daemon_list.root_path);
+        pr_info("Open directory '%s' failed", path);
         return false;
     }
 
@@ -141,15 +162,85 @@ static bool handle_directory(struct http_request *request)
     return true;
 }
 
+static int handle_file(struct http_request *request, const char *path)
+{
+    struct file *fp;
+    char *file_buf = NULL;
+    loff_t file_size;
+    int ret;
+
+    fp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(fp)) {
+        send_http_header(request->socket, 404, "Not Found", "text/plain", 14,
+                         "Close");
+        http_server_send(request->socket, "404 Not Found.", 14);
+        return -ENOENT;
+    }
+    file_size = i_size_read(file_inode(fp));
+
+    file_buf = kmalloc(file_size, GFP_KERNEL);
+    if (!file_buf) {
+        send_http_header(request->socket, 500, "Internal Server Error",
+                         "text/plain", 21, "Close");
+        http_server_send(request->socket, "Internal Server Error", 21);
+        filp_close(fp, NULL);
+        return -ENOMEM;
+    }
+
+    ret = kernel_read(fp, file_buf, file_size, &fp->f_pos);
+    if (ret < 0) {
+        send_http_header(request->socket, 500, "Internal Server Error",
+                         "text/plain", 18, "Close");
+        http_server_send(request->socket, "File read error.", 18);
+        kfree(file_buf);
+        filp_close(fp, NULL);
+        return ret;
+    }
+
+    send_http_header(request->socket, 200, "OK", "text/plain", file_size,
+                     "Close");
+
+    http_server_send(request->socket, file_buf, file_size);
+
+    kfree(file_buf);
+    filp_close(fp, NULL);
+
+    return 0;
+}
 
 static int http_server_response(struct http_request *request, int keep_alive)
 {
-    int ret = handle_directory(request);
-    if (!ret) {
-        pr_info("handle_directory failed\n");
-        return -1;
+    char full_path[256];
+    struct path path_info;
+    struct inode *inode;
+    int ret = 0;
+
+    snprintf(full_path, sizeof(full_path), "%s%s", daemon_list.root_path,
+             request->request_url);
+
+    ret = kern_path(full_path, LOOKUP_FOLLOW, &path_info);
+    if (ret < 0) {
+        send_http_header(request->socket, 404, "Not Found", "text/plain", 14,
+                         "Close");
+        http_server_send(request->socket, "404 Not Found.", 14);
+        return -ENOENT;
     }
-    return 0;
+
+    inode = path_info.dentry->d_inode;
+
+    if (S_ISDIR(inode->i_mode)) {
+        ret = handle_directory(request, full_path);
+    } else if (S_ISREG(inode->i_mode)) {
+        ret = handle_file(request, full_path);
+    } else {
+        send_http_header(request->socket, 403, "Forbidden", "text/plain", 9,
+                         "Close");
+        http_server_send(request->socket, "Forbidden", 9);
+        ret = -EPERM;
+    }
+
+    path_put(&path_info);
+    return ret;
 }
 
 static int http_parser_callback_message_begin(http_parser *parser)
