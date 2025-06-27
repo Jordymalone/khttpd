@@ -10,6 +10,7 @@
 
 #include "http_parser.h"
 #include "http_server.h"
+#include "mime_type.h"
 
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE 256
@@ -168,6 +169,7 @@ static int handle_file(struct http_request *request, const char *path)
     char *file_buf = NULL;
     loff_t file_size;
     int ret;
+    const char *content_type;
 
     fp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(fp)) {
@@ -196,8 +198,9 @@ static int handle_file(struct http_request *request, const char *path)
         filp_close(fp, NULL);
         return ret;
     }
+    content_type = get_mime_type_from_path(path);
 
-    send_http_header(request->socket, 200, "OK", "text/plain", file_size,
+    send_http_header(request->socket, 200, "OK", content_type, file_size,
                      "Close");
 
     http_server_send(request->socket, file_buf, file_size);
