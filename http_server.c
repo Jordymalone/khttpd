@@ -14,6 +14,8 @@
 
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE 256
+#define FILE_READ_BUFFER_SIZE \
+    4096  // Define a buffer size for reading file chunks
 
 /* Define fixed HTML content as constants for readability and efficiency */
 static const char HTML_DOC_HEADER[] =
@@ -75,11 +77,50 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+/**
+ * http_server_send_chunk - formats and sends a data chunk for chunked encoding.
+ * @sock: The socket to send the chunk to.
+ * @data: The data buffer to send. Can be NULL if len is 0.
+ * @len: The size of the data buffer. If 0, sends the terminating chunk.
+ *
+ * This function handles the chunk formatting (size in hex, CRLFs)
+ * automatically. Returns 0 on success, or a negative error code.
+ */
+static int http_server_send_chunk(struct socket *sock,
+                                  const char *data,
+                                  size_t len)
+{
+    if (len > 0) {
+        char size_hex[16];
+        int hex_len;
+        // For a data chunk:
+        // 1. Format the chunk size in hexadecimal, followed by \r\n.
+        hex_len = snprintf(size_hex, sizeof(size_hex), "%zx\r\n", len);
+
+        // 2. Send the hexadecimal size.
+        if (http_server_send(sock, size_hex, hex_len) < 0)
+            return -1;
+
+        // 3. Send the actual data.
+        if (http_server_send(sock, data, len) < 0)
+            return -1;
+
+        // 4. Send the terminating \r\n for the chunk.
+        if (http_server_send(sock, "\r\n", 2) < 0)
+            return -1;
+    } else {
+        // For the final, zero-length chunk: send "0\r\n\r\n".
+        if (http_server_send(sock, "0\r\n\r\n", 5) < 0)
+            return -1;
+    }
+    return 0;
+}
+
 static void send_http_header(struct socket *sock,
                              int status,
                              const char *status_msg,
                              const char *content_type,
-                             int content_len,
+                             loff_t content_len,
                              const char *conn_msg)
 {
     char header[SEND_BUFFER_SIZE];
@@ -90,9 +131,14 @@ static void send_http_header(struct socket *sock,
                    "Content-Type: %s\r\n"
                    "Connection: %s\r\n",
                    status, status_msg, content_type, conn_msg);
-    if (content_len >= 0) {
+    // If content_len is negative, use chunked encoding. Otherwise, use
+    // Content-Length.
+    if (content_len < 0) {
         len += snprintf(header + len, sizeof(header) - len,
-                        "Content-Length: %d\r\n", content_len);
+                        "Transfer-Encoding: chunked\r\n");
+    } else {
+        len += snprintf(header + len, sizeof(header) - len,
+                        "Content-Length: %lld\r\n", content_len);
     }
     snprintf(header + len, sizeof(header) - len, "\r\n");
     http_server_send(sock, header, strlen(header));
@@ -123,7 +169,8 @@ static bool tracedir(struct dir_context *dir_context,
         snprintf(buf, SEND_BUFFER_SIZE,
                  "<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", name, name);
     }
-    http_server_send(request->socket, buf, strlen(buf));
+    // Send each directory entry as a separate chunk using the helper function.
+    http_server_send_chunk(request->socket, buf, strlen(buf));
 
     return true;
 }
@@ -135,79 +182,82 @@ static bool handle_directory(struct http_request *request, const char *path)
     request->dir_context.actor = tracedir;
     if (request->method != HTTP_GET) {
         send_http_header(request->socket, 501, "Not Implemented", "text/plain",
-                         19, "Close");
+                         (loff_t) 19, "Close");
         http_server_send(request->socket, "501 Not Implemented", 19);
         return false;
     }
     send_http_header(request->socket, 200, "OK", "text/html", -1, "Keep-Alive");
-    http_server_send(request->socket, HTML_DOC_HEADER,
-                     sizeof(HTML_DOC_HEADER) - 1);
+    http_server_send_chunk(request->socket, HTML_DOC_HEADER,
+                           sizeof(HTML_DOC_HEADER) - 1);
 
     if (strcmp(request->request_url, "/") != 0) {
         char buf[SEND_BUFFER_SIZE] = {0};
         snprintf(buf, sizeof(buf),
                  "<tr><td><a href=\"..\">..</a></td></tr>\r\n");
-        http_server_send(request->socket, buf, strlen(buf));
+        http_server_send_chunk(request->socket, buf, strlen(buf));
     }
 
     fp = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
     if (IS_ERR(fp)) {
         pr_info("Open directory '%s' failed", path);
+        // If opening dir fails, we must still send the terminating chunk.
+        http_server_send_chunk(request->socket, NULL, 0);
         return false;
     }
 
     iterate_dir(fp, &request->dir_context);
     filp_close(fp, NULL);
-    http_server_send(request->socket, HTML_DOC_FOOTER,
-                     sizeof(HTML_DOC_FOOTER) - 1);
+    http_server_send_chunk(request->socket, HTML_DOC_FOOTER,
+                           sizeof(HTML_DOC_FOOTER) - 1);
+
+    // Send the final, zero-length chunk.
+    http_server_send_chunk(request->socket, NULL, 0);
     return true;
 }
 
 static int handle_file(struct http_request *request, const char *path)
 {
     struct file *fp;
-    char *file_buf = NULL;
-    loff_t file_size;
-    int ret;
     const char *content_type;
+    char *read_buf;
+    int ret;
 
     fp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(fp)) {
-        send_http_header(request->socket, 404, "Not Found", "text/plain", 14,
-                         "Close");
+        send_http_header(request->socket, 404, "Not Found", "text/plain",
+                         (loff_t) 14, "Close");
         http_server_send(request->socket, "404 Not Found.", 14);
         return -ENOENT;
     }
-    file_size = i_size_read(file_inode(fp));
 
-    file_buf = kmalloc(file_size, GFP_KERNEL);
-    if (!file_buf) {
-        send_http_header(request->socket, 500, "Internal Server Error",
-                         "text/plain", 21, "Close");
-        http_server_send(request->socket, "Internal Server Error", 21);
+    content_type = get_mime_type_from_path(path);
+
+    // 1. Send the HTTP header for chunked transfer.
+    //    We pass -1 to content_len to trigger "Transfer-Encoding: chunked".
+    send_http_header(request->socket, 200, "OK", content_type, -1,
+                     "Keep-Alive");
+
+    read_buf = kmalloc(FILE_READ_BUFFER_SIZE, GFP_KERNEL);
+    if (!read_buf) {
+        pr_err("khttpd: Failed to allocate file read buffer\n");
+        // Still need to properly terminate the response before closing.
+        http_server_send_chunk(request->socket, NULL, 0);
         filp_close(fp, NULL);
         return -ENOMEM;
     }
 
-    ret = kernel_read(fp, file_buf, file_size, &fp->f_pos);
-    if (ret < 0) {
-        send_http_header(request->socket, 500, "Internal Server Error",
-                         "text/plain", 18, "Close");
-        http_server_send(request->socket, "File read error.", 18);
-        kfree(file_buf);
-        filp_close(fp, NULL);
-        return ret;
+    // 2. Loop to read the file and send it chunk by chunk.
+    while ((ret = kernel_read(fp, read_buf, FILE_READ_BUFFER_SIZE,
+                              &fp->f_pos)) > 0) {
+        if (http_server_send_chunk(request->socket, read_buf, ret) < 0) {
+            pr_err("khttpd: Send file chunk failed\n");
+            break;  // Stop if sending fails
+        }
     }
-    content_type = get_mime_type_from_path(path);
-
-    send_http_header(request->socket, 200, "OK", content_type, file_size,
-                     "Close");
-
-    http_server_send(request->socket, file_buf, file_size);
-
-    kfree(file_buf);
+    kfree(read_buf);
+    // 3. Send the final, zero-length chunk to signify the end of the response.
+    http_server_send_chunk(request->socket, NULL, 0);
     filp_close(fp, NULL);
-
     return 0;
 }
 
@@ -223,8 +273,8 @@ static int http_server_response(struct http_request *request, int keep_alive)
 
     ret = kern_path(full_path, LOOKUP_FOLLOW, &path_info);
     if (ret < 0) {
-        send_http_header(request->socket, 404, "Not Found", "text/plain", 14,
-                         "Close");
+        send_http_header(request->socket, 404, "Not Found", "text/plain",
+                         (loff_t) 14, "Close");
         http_server_send(request->socket, "404 Not Found.", 14);
         return -ENOENT;
     }
@@ -236,8 +286,8 @@ static int http_server_response(struct http_request *request, int keep_alive)
     } else if (S_ISREG(inode->i_mode)) {
         ret = handle_file(request, full_path);
     } else {
-        send_http_header(request->socket, 403, "Forbidden", "text/plain", 9,
-                         "Close");
+        send_http_header(request->socket, 403, "Forbidden", "text/plain",
+                         (loff_t) 9, "Close");
         http_server_send(request->socket, "Forbidden", 9);
         ret = -EPERM;
     }
