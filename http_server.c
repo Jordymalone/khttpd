@@ -299,9 +299,13 @@ static int http_server_response(struct http_request *request, int keep_alive)
 static int http_parser_callback_message_begin(http_parser *parser)
 {
     struct http_request *request = parser->data;
-    struct socket *socket = request->socket;
-    memset(request, 0x00, sizeof(struct http_request));
-    request->socket = socket;
+    /*
+     * Reset only the per-request fields. node and khttpd_work are still
+     * used by daemon_list and the workqueue, so don't memset the whole struct.
+     */
+    request->method = 0;
+    request->request_url[0] = '\0';
+    request->complete = 0;
     return 0;
 }
 
@@ -395,7 +399,7 @@ static void http_server_worker(struct work_struct *work)
 static struct work_struct *create_work(struct socket *sk)
 {
     struct http_request *work =
-        kmalloc(sizeof(*work), GFP_KERNEL);  // GFP_KERNEL is used to allocate
+        kzalloc(sizeof(*work), GFP_KERNEL);  // GFP_KERNEL is used to allocate
                                              // memory that can be freed later
     if (!work) {
         pr_err("can't allocate memory for work!\n");
