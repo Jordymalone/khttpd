@@ -2,6 +2,7 @@
 
 #include <linux/fs.h>
 #include <linux/kthread.h>
+#include <linux/mutex.h>
 #include <linux/namei.h>  // for kern_path
 #include <linux/path.h>   // for struct path
 #include <linux/sched/signal.h>
@@ -28,6 +29,8 @@ static const char HTML_DOC_FOOTER[] = "</table></body></html>\r\n";
 
 extern struct workqueue_struct *khttpd_wq;
 struct httpd_service daemon_list = {.is_stopped = false, .root_path = NULL};
+/* Protects daemon_list.head: the daemon adds, workers remove. */
+static DEFINE_MUTEX(daemon_list_lock);
 
 struct http_request {
     struct socket *socket;
@@ -373,7 +376,7 @@ static void http_server_worker(struct work_struct *work)
     buf = kzalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
     if (!buf) {
         pr_err("can't allocate memory!\n");
-        return;
+        goto out;
     }
 
     http_parser_init(&parser, HTTP_REQUEST);
@@ -390,10 +393,16 @@ static void http_server_worker(struct work_struct *work)
             break;
         memset(buf, 0, RECV_BUFFER_SIZE);
     }
+    kfree(buf);
+out:
+    /* Leave daemon_list first, so free_work() can no longer reach us. */
+    mutex_lock(&daemon_list_lock);
+    list_del(&worker->node);
+    mutex_unlock(&daemon_list_lock);
+
     kernel_sock_shutdown(worker->socket, SHUT_RDWR);
     sock_release(worker->socket);
-    kfree(buf);
-    return;
+    kfree(worker);  // freeing its own work item here is allowed
 }
 
 static struct work_struct *create_work(struct socket *sk)
@@ -407,20 +416,25 @@ static struct work_struct *create_work(struct socket *sk)
     }
     work->socket = sk;
     INIT_WORK(&work->khttpd_work, http_server_worker);
+    mutex_lock(&daemon_list_lock);
     list_add(&work->node, &daemon_list.head);
+    mutex_unlock(&daemon_list_lock);
     return &work->khttpd_work;
 }
 
+/*
+ * Shut down every socket to wake up workers blocked in recv().
+ * Each worker then releases its own request; destroy_workqueue() waits for it.
+ */
 static void free_work(void)
 {
-    struct http_request *tar, *tmp;
+    struct http_request *tar;
 
-    list_for_each_entry_safe (tar, tmp, &daemon_list.head, node) {
+    mutex_lock(&daemon_list_lock);
+    list_for_each_entry (tar, &daemon_list.head, node) {
         kernel_sock_shutdown(tar->socket, SHUT_RDWR);
-        flush_work(&tar->khttpd_work);
-        sock_release(tar->socket);
-        kfree(tar);
     }
+    mutex_unlock(&daemon_list_lock);
 }
 
 int http_server_daemon(void *arg)
