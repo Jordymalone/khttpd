@@ -381,7 +381,7 @@ static void http_server_worker(struct work_struct *work)
 
     http_parser_init(&parser, HTTP_REQUEST);
     parser.data = worker;
-    while (!daemon_list.is_stopped) {
+    while (!READ_ONCE(daemon_list.is_stopped)) {
         int ret = http_server_recv(worker->socket, buf, RECV_BUFFER_SIZE - 1);
         if (ret <= 0) {
             if (ret)
@@ -465,7 +465,7 @@ int http_server_daemon(void *arg)
         }
         queue_work(khttpd_wq, work);
     }
-    daemon_list.is_stopped = true;
+    WRITE_ONCE(daemon_list.is_stopped, true);
     free_work();
 
     return 0;
