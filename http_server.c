@@ -72,9 +72,13 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
         };
         int length = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
         if (length < 0) {
-            pr_err("write error: %d\n", length);
-            break;
+            /* -EPIPE or -ECONNRESET: the client went away, which is normal. */
+            if (length != -EPIPE && length != -ECONNRESET)
+                pr_err("write error: %d\n", length);
+            return length;
         }
+        if (length == 0) /* not expected from TCP; never loop forever */
+            return -EIO;
         done += length;
     }
     return done;
@@ -93,6 +97,8 @@ static int http_server_send_chunk(struct socket *sock,
                                   const char *data,
                                   size_t len)
 {
+    int ret;
+
     if (len > 0) {
         char size_hex[16];
         int hex_len;
@@ -101,20 +107,24 @@ static int http_server_send_chunk(struct socket *sock,
         hex_len = snprintf(size_hex, sizeof(size_hex), "%zx\r\n", len);
 
         // 2. Send the hexadecimal size.
-        if (http_server_send(sock, size_hex, hex_len) < 0)
-            return -1;
+        ret = http_server_send(sock, size_hex, hex_len);
+        if (ret < 0)
+            return ret;
 
         // 3. Send the actual data.
-        if (http_server_send(sock, data, len) < 0)
-            return -1;
+        ret = http_server_send(sock, data, len);
+        if (ret < 0)
+            return ret;
 
         // 4. Send the terminating \r\n for the chunk.
-        if (http_server_send(sock, "\r\n", 2) < 0)
-            return -1;
+        ret = http_server_send(sock, "\r\n", 2);
+        if (ret < 0)
+            return ret;
     } else {
         // For the final, zero-length chunk: send "0\r\n\r\n".
-        if (http_server_send(sock, "0\r\n\r\n", 5) < 0)
-            return -1;
+        ret = http_server_send(sock, "0\r\n\r\n", 5);
+        if (ret < 0)
+            return ret;
     }
     return 0;
 }
@@ -172,10 +182,8 @@ static bool tracedir(struct dir_context *dir_context,
         snprintf(buf, SEND_BUFFER_SIZE,
                  "<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", name, name);
     }
-    // Send each directory entry as a separate chunk using the helper function.
-    http_server_send_chunk(request->socket, buf, strlen(buf));
-
-    return true;
+    // Send each directory entry as a separate chunk; stop once sending fails.
+    return http_server_send_chunk(request->socket, buf, strlen(buf)) == 0;
 }
 
 static bool handle_directory(struct http_request *request, const char *path)
